@@ -1,73 +1,135 @@
 ﻿using System.Diagnostics;
 
 // 320ifier - parallel automatic bulk transcoding toolkit
-// 2023-2024 Nightshade System
+// 2023-2026 Nightshade System
 // warning: this program will use as many cores as it can, be careful
+// ^ no it doesn't as of 15/06/2026 and whoever wrote that is wrong
 
 namespace ThreeTwentyfier;
 
 public static class Program
 {
-    static List<WorkUnit> GetPsiList(Mode mode)
+    private static int coreLimit;
+    private static bool recursive;
+    private static bool ultraslow;
+
+    static List<string> RecursiveEnumerateFiles(string path, int level = 0)
+    {
+        if (level >= 20)
+            throw new Exception("recursed too deep, there's probably a symlink in your input, get rid of it");
+
+        var output = new List<string>();
+        var dir = Directory.EnumerateFileSystemEntries(path);
+        foreach (var entry in dir)
+        {
+            if (Directory.Exists(entry))
+            {
+                var subfolder = RecursiveEnumerateFiles(entry, level++);
+                subfolder.ForEach(output.Add);
+            } else if (File.Exists(entry))
+            {
+                output.Add(entry);
+            }
+            else
+            {
+                throw new Exception("What the fuck?");
+            }
+        }
+
+        return output;
+    }
+    
+    static List<WorkUnit> BuildWorkUnitList(Mode mode)
     {
         var list = new List<WorkUnit>();
 
-        var baseDir = Path.GetFileName(Environment.CurrentDirectory);
-        Directory.CreateDirectory(baseDir);
-
-        var procCount = Environment.ProcessorCount;
         var currentThread = 0u;
         var currentId = 0u;
+
+        IEnumerable<string> files;
+        if (recursive) files = RecursiveEnumerateFiles("input");
+        else files = Directory.EnumerateFiles("input");
         
-        var dir = Directory.EnumerateFiles("input");
-        foreach (var f in dir)
+        var searchExtension = mode switch
         {
-            var filename = Path.GetFileNameWithoutExtension(f);
-            var workingDirectory = Environment.CurrentDirectory;
-            var inputFile = Path.Combine(workingDirectory, "input", $"{filename}.flac");
-            var outputFile = Path.Combine(workingDirectory, baseDir, filename);
+            Mode.Wav2Flac => "wav",
+            _ => "flac"
+        };
+
+        var outputDirectory = Path.Combine(Environment.CurrentDirectory, "output");
+        if (!Directory.Exists(outputDirectory)) Directory.CreateDirectory(outputDirectory);
+
+        files = files.Where(e => Path.GetExtension(e)[1..] == searchExtension);
+        foreach (var inputPath in files)
+        {
+            var filename = Path.GetFileNameWithoutExtension(inputPath);
+            
+            var fragments =
+                inputPath.Split(Path.DirectorySeparatorChar).Skip(1).ToArray();
+            for (int i=0; i<fragments.Length; i++)
+            {
+                var t = Path.Combine(Environment.CurrentDirectory, "output", Path.Combine(fragments[..i]));
+                if (!Directory.Exists(t)) Directory.CreateDirectory(t);
+            }
+
+            var combined = Path.Combine(fragments);
+            var outputPath =
+                Path.Combine("output", combined)[..^(searchExtension.Length+1)];
+
+            var fullInputPath = Path.Combine(Environment.CurrentDirectory, inputPath);
+            
             var extension = mode switch
             {
                 Mode.To320 => "mp3",
                 Mode.To16Bit => "flac",
                 Mode.ToV0 => "mp3",
+                Mode.Wav2Flac => "flac",
                 _ => throw new ArgumentOutOfRangeException(nameof(mode))
             };
+            outputPath += $".{extension}";
+            
             var psi = mode switch
             {
                 Mode.To320 => new ProcessStartInfo
                 {
                     FileName = @"ffmpeg",
                     Arguments = $"""
-                                 -y -i "{inputFile}" -ab 320k -map_metadata 0 -id3v2_version 3 "{outputFile}.{extension}"
+                                 -y -i "{fullInputPath}" -ab 320k -map_metadata 0 -id3v2_version 3 "{outputPath}"
                                  """
                 },
                 Mode.To16Bit => new ProcessStartInfo
                 {
                     FileName = @"ffmpeg",
                     Arguments = $"""
-                                 -y -i "{inputFile}" -sample_fmt s16 "{outputFile}.{extension}"
+                                 -y -i "{fullInputPath}" -sample_fmt s16 "{outputPath}"
                                  """
                 },
                 Mode.ToV0 => new ProcessStartInfo
                 {
                     FileName = @"ffmpeg",
                     Arguments = $"""
-                                 -y -i "{inputFile}" -c:a libmp3lame -q:a 0 -map_metadata 0 -id3v2_version 3 "{outputFile}.{extension}"
+                                 -y -i "{fullInputPath}" -c:a libmp3lame -q:a 0 -map_metadata 0 -id3v2_version 3 "{outputPath}"
+                                 """
+                },
+                Mode.Wav2Flac => new ProcessStartInfo
+                {
+                    FileName = @"ffmpeg",
+                    Arguments = $"""
+                                 -y -i "{fullInputPath}" -c:a flac {(ultraslow ? "-compression_level 12 -exact_rice_parameters 1" : "")} "{outputPath}"
                                  """
                 },
                 _ => throw new ArgumentOutOfRangeException(nameof(mode))
             };
             psi.CreateNoWindow = true;
             psi.UseShellExecute = true;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
             list.Add(new()
             {
                 Info = psi,
-                ThreadId = currentThread++,
+                ThreadId = (uint)(currentThread++ % coreLimit),
                 FileName = filename,
                 WorkId = currentId++
             });
-            if (currentThread >= procCount) currentThread = 0;
         }
 
         return list;
@@ -78,32 +140,68 @@ public static class Program
         var mode = Mode.To320;
         if (args.Length > 0)
         {
-            switch (args[0])
+            foreach (var arg in args)
             {
-                case "16bit":
-                    Console.WriteLine("16-bit mode");
-                    mode = Mode.To16Bit;
-                    break;
-                case "v0":
-                    Console.WriteLine("v0 mode");
-                    mode = Mode.ToV0;
-                    break;
+                switch (arg)
+                {
+                    case "16bit":
+                        Console.WriteLine("16-bit mode");
+                        mode = Mode.To16Bit;
+                        break;
+                    case "v0":
+                        Console.WriteLine("v0 mode");
+                        mode = Mode.ToV0;
+                        break;
+                    case "wav2flac":
+                        Console.WriteLine("wav2flac mode");
+                        mode = Mode.Wav2Flac;
+                        break;
+                    case "recursive":
+                    case "recur":
+                        Console.WriteLine("Recursive mode enabled");
+                        recursive = true;
+                        break;
+                    case "ultraslow":
+                    case "i-hate-my-computer":
+                        Console.WriteLine("Doing it ultraslow (significantly better compression but slow as molasses)");
+                        ultraslow = true;
+                        break;
+                }
+
+                if (arg.StartsWith("cores="))
+                {
+                    var val = arg["cores=".Length..];
+                    if (val == "all" || val == "fuck-me-up")
+                    {
+                        Console.WriteLine("All the cores? Alright, all the cores");
+                        coreLimit = Environment.ProcessorCount;
+                    }
+                    else
+                    {
+                        coreLimit = int.Parse(val);
+                    }
+                }
             }
         }
 
-        var processStartInfoList = GetPsiList(mode);
-        var fileCount = processStartInfoList.Count;
-        var psiSlots = Environment.ProcessorCount;
+        if (coreLimit == 0)
+        {
+            // default to half the cores on the machine
+            coreLimit = Environment.ProcessorCount / 2;
+        }
 
-        if (psiSlots > fileCount) psiSlots = fileCount;
+        var workUnits = BuildWorkUnitList(mode);
         
-        Console.WriteLine($"Starting {psiSlots} threads");
+        var fileCount = workUnits.Count;
+        var usableCores = Math.Min(coreLimit, fileCount);
+        
+        Console.WriteLine($"Starting {usableCores} threads");
         
         var complete = 0;
         var threads = new List<Thread>();
         var timeAtStart = Stopwatch.GetTimestamp();
         
-        for (uint i = 0; i < psiSlots; i++)
+        for (uint i = 0; i < usableCores; i++)
         {
             var threadId = i;
             var thread = new Thread(() =>
@@ -111,9 +209,9 @@ public static class Program
                 var done = new List<uint>();
                 while (true)
                 {
-                    if (processStartInfoList.Count == 0) break;
+                    if (workUnits.Count == 0) break;
                     
-                    var psi = processStartInfoList.FirstOrDefault(x =>
+                    var psi = workUnits.FirstOrDefault(x =>
                         x.ThreadId == threadId && !done.Contains(x.WorkId));
                     if (psi == null) break;
                     
@@ -136,8 +234,10 @@ public static class Program
 
         var timeAtEnd = Stopwatch.GetElapsedTime(timeAtStart);
 
-        Console.WriteLine(timeAtEnd.TotalSeconds > 60
-            ? $"Complete! Took {timeAtEnd.TotalMinutes}m:{timeAtEnd.TotalSeconds % 60}s."
-            : $"Complete! Took {timeAtEnd.TotalSeconds} seconds.");
+        var timeElapsed = timeAtEnd.TotalSeconds > 60
+            ? $"{Math.Floor(timeAtEnd.TotalMinutes)}m:{Math.Floor(timeAtEnd.TotalSeconds % 60)}s"
+            : $"{Math.Floor(timeAtEnd.TotalSeconds)} seconds";
+        
+        Console.WriteLine($"Complete! Processed {fileCount} files in {timeElapsed}.");
     }
 }

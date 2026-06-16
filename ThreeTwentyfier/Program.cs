@@ -5,14 +5,38 @@
 // warning: this program will use as many cores as it can, be careful
 // ^ no it doesn't as of 15/06/2026 and whoever wrote that is wrong
 
+// how to 320ify:
+//   - have ffmpeg in your path
+//   - put your files in a folder named "input"
+//   - run 320ifier
+//   - your freshly-baked files will be in the output folder
+
 namespace ThreeTwentyfier;
 
 public static class Program
 {
+    enum Mode
+    {
+        To320,
+        To16Bit,
+        ToV0,
+        Wav2Flac
+    }
+    
+    class WorkUnit
+    {
+        public ProcessStartInfo Info = null!;
+        public int ThreadId;
+        public string FileName = "";
+        public int WorkId;
+    }
+    
     private static int coreLimit;
     private static bool recursive;
     private static bool ultraslow;
 
+    // ReSharper disable once ParameterOnlyUsedForPreconditionCheck.Local
+    // Yeah, and so fucking what if it is?
     static List<string> RecursiveEnumerateFiles(string path, int level = 0)
     {
         if (level >= 20)
@@ -41,10 +65,8 @@ public static class Program
     
     static List<WorkUnit> BuildWorkUnitList(Mode mode)
     {
-        var list = new List<WorkUnit>();
-
-        var currentThread = 0u;
-        var currentId = 0u;
+        var currentThread = 0;
+        var currentId = 0;
 
         IEnumerable<string> files;
         if (recursive) files = RecursiveEnumerateFiles("input");
@@ -58,15 +80,17 @@ public static class Program
 
         var outputDirectory = Path.Combine(Environment.CurrentDirectory, "output");
         if (!Directory.Exists(outputDirectory)) Directory.CreateDirectory(outputDirectory);
-
+        
         files = files.Where(e => Path.GetExtension(e)[1..] == searchExtension);
+        
+        var workUnits = new List<WorkUnit>();
         foreach (var inputPath in files)
         {
             var filename = Path.GetFileNameWithoutExtension(inputPath);
             
             var fragments =
                 inputPath.Split(Path.DirectorySeparatorChar).Skip(1).ToArray();
-            for (int i=0; i<fragments.Length; i++)
+            for (var i=0; i<fragments.Length; i++)
             {
                 var t = Path.Combine(Environment.CurrentDirectory, "output", Path.Combine(fragments[..i]));
                 if (!Directory.Exists(t)) Directory.CreateDirectory(t);
@@ -86,53 +110,46 @@ public static class Program
                 Mode.Wav2Flac => "flac",
                 _ => throw new ArgumentOutOfRangeException(nameof(mode))
             };
-            outputPath += $".{extension}";
-            
-            var psi = mode switch
+
+            var ffmpegArgs = "";
+            var psi = new ProcessStartInfo
             {
-                Mode.To320 => new ProcessStartInfo
-                {
-                    FileName = @"ffmpeg",
-                    Arguments = $"""
-                                 -y -i "{fullInputPath}" -ab 320k -map_metadata 0 -id3v2_version 3 "{outputPath}"
-                                 """
-                },
-                Mode.To16Bit => new ProcessStartInfo
-                {
-                    FileName = @"ffmpeg",
-                    Arguments = $"""
-                                 -y -i "{fullInputPath}" -sample_fmt s16 "{outputPath}"
-                                 """
-                },
-                Mode.ToV0 => new ProcessStartInfo
-                {
-                    FileName = @"ffmpeg",
-                    Arguments = $"""
-                                 -y -i "{fullInputPath}" -c:a libmp3lame -q:a 0 -map_metadata 0 -id3v2_version 3 "{outputPath}"
-                                 """
-                },
-                Mode.Wav2Flac => new ProcessStartInfo
-                {
-                    FileName = @"ffmpeg",
-                    Arguments = $"""
-                                 -y -i "{fullInputPath}" -c:a flac {(ultraslow ? "-compression_level 12 -exact_rice_parameters 1" : "")} "{outputPath}"
-                                 """
-                },
-                _ => throw new ArgumentOutOfRangeException(nameof(mode))
+                FileName = "ffmpeg",
+                CreateNoWindow = true,
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Hidden
             };
-            psi.CreateNoWindow = true;
-            psi.UseShellExecute = true;
-            psi.WindowStyle = ProcessWindowStyle.Hidden;
-            list.Add(new()
+
+            switch (mode)
+            {
+                case Mode.To320:
+                    ffmpegArgs += "-c:a libmp3lame -ab 320k -map_metadata 0 -id3v2_version 3";
+                    break;
+                case Mode.To16Bit:
+                    ffmpegArgs += "-sample_fmt s16";
+                    break;
+                case Mode.ToV0:
+                    ffmpegArgs += "-c:a libmp3lame -q:a 0 -map_metadata 0 -id3v2_version 3";
+                    break;
+                case Mode.Wav2Flac:
+                    ffmpegArgs += "-c:a flac";
+                    if (ultraslow)
+                        ffmpegArgs += " -compression_level 12 -exact_rice_parameters 1";
+                    break;
+            }
+
+            outputPath += $".{extension}";
+            psi.Arguments = $"-y -i \"{fullInputPath}\" {ffmpegArgs} \"{outputPath}\"";
+            workUnits.Add(new WorkUnit
             {
                 Info = psi,
-                ThreadId = (uint)(currentThread++ % coreLimit),
+                ThreadId = currentThread++ % coreLimit,
                 FileName = filename,
                 WorkId = currentId++
             });
         }
 
-        return list;
+        return workUnits;
     }
     
     public static void Main(string[] args)
@@ -163,7 +180,12 @@ public static class Program
                         break;
                     case "ultraslow":
                     case "i-hate-my-computer":
-                        Console.WriteLine("Doing it ultraslow (significantly better compression but slow as molasses)");
+                        if (mode != Mode.Wav2Flac)
+                        {
+                            Console.Error.WriteLine("It makes no sense to run modes that aren't wav2flac in ultraslow");
+                            Environment.Exit(1);
+                        }
+                        Console.WriteLine("Doing it ultraslow (significantly better compression with wav2flac but slow as molasses)");
                         ultraslow = true;
                         break;
                 }
@@ -171,14 +193,24 @@ public static class Program
                 if (arg.StartsWith("cores="))
                 {
                     var val = arg["cores=".Length..];
-                    if (val == "all" || val == "fuck-me-up")
+                    if (val is "all" or "fuck-me-up")
                     {
                         Console.WriteLine("All the cores? Alright, all the cores");
                         coreLimit = Environment.ProcessorCount;
                     }
                     else
                     {
-                        coreLimit = int.Parse(val);
+                        if (!int.TryParse(val, out coreLimit))
+                        {
+                            Console.Error.WriteLine("Argument to cores= must be a number (or 'all'), come the hell on");
+                            Environment.Exit(1);
+                        }
+
+                        if (coreLimit < 0)
+                        {
+                            Console.Error.WriteLine("Unless you've figured out how to produce a processor made of antimatter, I don't think a negative core count is gonna work");
+                            Environment.Exit(1);
+                        }
                     }
                 }
             }
@@ -190,10 +222,22 @@ public static class Program
             coreLimit = Environment.ProcessorCount / 2;
         }
 
+        if (!Directory.Exists(Path.Combine(Environment.CurrentDirectory, "input")))
+        {
+            Console.Error.WriteLine("Input directory does not exist; create it within the current working directory and put your files in there");
+            Environment.Exit(1);
+        }
+
         var workUnits = BuildWorkUnitList(mode);
         
         var fileCount = workUnits.Count;
         var usableCores = Math.Min(coreLimit, fileCount);
+
+        if (fileCount == 0)
+        {
+            Console.Error.WriteLine("Was not able to find any files to transcode, nothing to do");
+            Environment.Exit(1);
+        }
         
         Console.WriteLine($"Starting {usableCores} threads");
         
@@ -201,12 +245,12 @@ public static class Program
         var threads = new List<Thread>();
         var timeAtStart = Stopwatch.GetTimestamp();
         
-        for (uint i = 0; i < usableCores; i++)
+        for (var i = 0; i < usableCores; i++)
         {
             var threadId = i;
             var thread = new Thread(() =>
             {
-                var done = new List<uint>();
+                var done = new List<int>();
                 while (true)
                 {
                     if (workUnits.Count == 0) break;
@@ -224,7 +268,7 @@ public static class Program
                     
                     Console.WriteLine($"Thread {threadId} finished '{psi.FileName}' ({++complete}/{fileCount})");
                 }
-                Console.WriteLine($"Thread {threadId} exhausted work pool");
+                Console.WriteLine($"Thread {threadId} completed its work pool");
             });
             thread.Start();
             threads.Add(thread);
